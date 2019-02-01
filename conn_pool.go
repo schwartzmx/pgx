@@ -13,9 +13,10 @@ import (
 
 type ConnPoolConfig struct {
 	ConnConfig
-	MaxConnections int               // max simultaneous connections to use, default 5, must be at least 2
-	AfterConnect   func(*Conn) error // function to call on every new connection
-	AcquireTimeout time.Duration     // max wait time when all connections are busy (0 means no timeout)
+	MaxConnections  int               // max simultaneous connections to use, default 5, must be at least 2
+	MaxConnLifetime time.Duration     // time duration that will be used to close idle connections that are idle longer than the duration
+	AfterConnect    func(*Conn) error // function to call on every new connection
+	AcquireTimeout  time.Duration     // max wait time when all connections are busy (0 means no timeout)
 }
 
 type ConnPool struct {
@@ -25,6 +26,7 @@ type ConnPool struct {
 	config               ConnConfig // config used when establishing connection
 	inProgressConnects   int
 	maxConnections       int
+	maxConnLifetime      time.Duration
 	resetCount           int
 	afterConnect         func(*Conn) error
 	logger               Logger
@@ -36,9 +38,10 @@ type ConnPool struct {
 }
 
 type ConnPoolStat struct {
-	MaxConnections       int // max simultaneous connections to use
-	CurrentConnections   int // current live connections
-	AvailableConnections int // unused live connections
+	MaxConnections       int           // max simultaneous connections to use
+	MaxConnLifetime      time.Duration // duration that connection should remain idle in pool
+	CurrentConnections   int           // current live connections
+	AvailableConnections int           // unused live connections
 }
 
 // CheckedOutConnections returns the amount of connections that are currently
@@ -66,6 +69,9 @@ func NewConnPool(config ConnPoolConfig) (p *ConnPool, err error) {
 	if p.maxConnections < 1 {
 		return nil, errors.New("MaxConnections must be at least 1")
 	}
+
+	p.maxConnLifetime = config.MaxConnLifetime
+
 	p.acquireTimeout = config.AcquireTimeout
 	if p.acquireTimeout < 0 {
 		return nil, errors.New("AcquireTimeout must be equal to or greater than 0")
@@ -99,7 +105,26 @@ func NewConnPool(config ConnPoolConfig) (p *ConnPool, err error) {
 	p.availableConnections = append(p.availableConnections, c)
 	p.connInfo = c.ConnInfo.DeepCopy()
 
+	// Spawn a go routine that will handle closing connections determined by the MaxConnLifetime property,  and only do this if it is > 0
+	if p.maxConnLifetime > 0 {
+		go p.connectionLifetimeCleaner()
+	}
+
 	return
+}
+
+func (p *ConnPool) connectionLifetimeCleaner() {
+	for {
+		time.Sleep(time.Second * 30)
+		lifetime := p.maxConnLifetime
+		now := time.Now()
+		for i := 0; i < len(p.availableConnections); i++ {
+			c := p.availableConnections[i]
+			if c.creationTime.Add(lifetime).Before(now) {
+				c.Close()
+			}
+		}
+	}
 }
 
 // Acquire takes exclusive use of a connection until it is released.
